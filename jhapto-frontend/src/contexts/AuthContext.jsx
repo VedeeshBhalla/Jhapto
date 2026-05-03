@@ -1,0 +1,54 @@
+import React, { createContext, useState, useEffect } from 'react';
+import api from '../utils/api';
+
+export const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [admin, setAdmin] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // Check if user or admin is already logged in
+    const token = localStorage.getItem('token');
+    const storedUser = localStorage.getItem('user');
+    const storedAdmin = localStorage.getItem('admin');
+
+    if (token) {
+      if (storedUser) setUser(JSON.parse(storedUser));
+      if (storedAdmin) setAdmin(JSON.parse(storedAdmin));
+    }
+    setLoading(false);
+  }, []);
+
+  const loginUser = async (email, password) => {
+    const res = await api.post('/auth/login', { email, password });
+    localStorage.setItem('token', res.data.token);
+    localStorage.setItem('user', JSON.stringify(res.data.student));
+    setUser(res.data.student);
+    return res.data;
+  };
+
+  const loginAdmin = async (email, password) => {
+    const res = await api.post('/admin/login', { email, password });
+    localStorage.setItem('token', res.data.token);
+    const adminData = { email, is_admin: true }; // Extracting logic or token parsing can be added here
+    localStorage.setItem('admin', JSON.stringify(adminData));
+    setAdmin(adminData);
+    return res.data;
+  };
+
+  const logout = () => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    localStorage.removeItem('admin');
+    setUser(null);
+    setAdmin(null);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, admin, loading, loginUser, loginAdmin, logout }}>
+      {!loading && children}
+    </AuthContext.Provider>
+  );
+};

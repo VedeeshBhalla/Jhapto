@@ -1,0 +1,12 @@
+# env files
+.env
+.env.*
+**/.env
+**/.env.*
+
+# node modules
+node_modules/
+**/node_modules/
+
+# logs
+*.log

@@ -1,0 +1,16 @@
+# ENV files (IMPORTANT)
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
