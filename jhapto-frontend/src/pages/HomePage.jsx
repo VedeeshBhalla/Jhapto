@@ -1,184 +1,166 @@
 import React, { useState, useEffect, useContext } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { AnimatePresence, LayoutGroup, motion } from 'framer-motion';
+import { SearchX, Plus } from 'lucide-react';
 import Header from '../components/Header';
 import HeroBanner from '../components/HeroBanner';
-import CategoryList from '../components/CategoryList';
+import CategoryList, { SAVED } from '../components/CategoryList';
 import ProductCard from '../components/ProductCard';
 import FloatingCart from '../components/FloatingCart';
-import { AuthContext } from '../contexts/AuthContext';
+import { AuthContext } from '../contexts/auth';
+import { useCart } from '../contexts/cart';
+import { useToast } from '../contexts/toast';
+import useFavorites from '../hooks/useFavorites';
 import api from '../utils/api';
+
+const SkeletonCard = () => (
+  <div className="product-skeleton" aria-hidden="true">
+    <div className="skeleton-block" style={{ height: 18, width: '40%', marginLeft: 'auto' }} />
+    <div className="skeleton-block" style={{ aspectRatio: '4 / 3' }} />
+    <div className="skeleton-block" style={{ height: 16, width: '75%' }} />
+    <div className="skeleton-block" style={{ height: 12, width: '50%' }} />
+    <div className="skeleton-block" style={{ height: 32, width: '45%' }} />
+  </div>
+);
 
 const HomePage = () => {
   const [products, setProducts] = useState([]);
-  const [cartItems, setCartItems] = useState([]);
+  const [categories, setCategories] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState(null);
-  const [notification, setNotification] = useState({ message: '', type: '' });
-  const { user, logout } = useContext(AuthContext);
-  const navigate = useNavigate();
-
   const [searchQuery, setSearchQuery] = useState('');
-
-  const showNotification = (message, type = 'success') => {
-    setNotification({ message, type });
-    setTimeout(() => setNotification({ message: '', type: '' }), 3000);
-  };
-
-  useEffect(() => {
-    fetchProducts();
-  }, []);
+  const [loading, setLoading] = useState(true);
+  const { user, logout } = useContext(AuthContext);
+  const cart = useCart();
+  const toast = useToast();
+  const favorites = useFavorites();
+  const navigate = useNavigate();
 
   const fetchProducts = async () => {
     try {
-      const [listingsRes, itemsRes] = await Promise.all([
+      const [listingsRes, categoriesRes] = await Promise.all([
         api.get('/listings'),
-        api.get('/listings/items')
+        api.get('/listings/categories'),
       ]);
-      
-      const itemCatMap = {};
-      if (itemsRes.data) {
-        itemsRes.data.forEach(item => {
-          itemCatMap[item.item_name] = item.category_name;
-        });
-      }
-
-      const enrichedListings = listingsRes.data.map(listing => ({
-        ...listing,
-        category_name: itemCatMap[listing.item_name] || 'Other'
-      }));
-
-      setProducts(enrichedListings);
+      setProducts(listingsRes.data);
+      setCategories(categoriesRes.data);
     } catch (err) {
       console.error('Failed to fetch listings', err);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleAddToCart = (product) => {
-    setCartItems(prev => {
-      const existing = prev.find(item => item.listing_id === product.listing_id);
-      if (existing) {
-        if (existing.quantity >= product.quantity_available) {
-          showNotification(`Only ${product.quantity_available} units available in stock!`, 'error');
-          return prev;
-        }
-        return prev.map(item => 
-          item.listing_id === product.listing_id 
-            ? { ...item, quantity: item.quantity + 1 }
-            : item
-        );
-      }
-      if (product.quantity_available < 1) {
-        showNotification(`This item is out of stock!`, 'error');
-        return prev;
-      }
-      return [...prev, { ...product, quantity: 1 }];
-    });
-  };
+  useEffect(() => { fetchProducts(); }, []);
 
-  const handleRemoveFromCart = (product) => {
-    setCartItems(prev => {
-      const existing = prev.find(item => item.listing_id === product.listing_id);
-      if (!existing) return prev;
-      if (existing.quantity === 1) {
-        return prev.filter(item => item.listing_id !== product.listing_id);
-      }
-      return prev.map(item => 
-        item.listing_id === product.listing_id 
-          ? { ...item, quantity: item.quantity - 1 }
-          : item
-      );
-    });
+  // "Saved" filter disappears once nothing is saved
+  useEffect(() => {
+    if (selectedCategory === SAVED && favorites.ids.length === 0) setSelectedCategory(null);
+  }, [favorites.ids.length, selectedCategory]);
+
+  const handleAddToCart = (product) => {
+    const error = cart.add(product);
+    if (error) toast(error, 'error');
   };
 
   const handleCheckout = async () => {
     try {
-      for (const item of cartItems) {
-        await api.post('/orders', {
-          listing_id: item.listing_id,
-          quantity: item.quantity
-        });
-      }
-      showNotification('Order(s) placed successfully!');
-      setCartItems([]);
-      setTimeout(() => navigate('/orders'), 1500);
+      const result = await cart.checkout();
+      if (!result) return;   // already placing
+      toast(result.message || 'Order placed!');
+      setTimeout(() => navigate('/orders'), 900);
     } catch (err) {
-      showNotification(err.response?.data?.message || 'Error placing order', 'error');
+      toast(err.response?.data?.message || 'Error placing order', 'error');
+      fetchProducts(); // stock may have changed — refresh what's available
     }
   };
 
-  const totalCartItems = cartItems.reduce((acc, item) => acc + item.quantity, 0);
-
+  const query = searchQuery.trim().toLowerCase();
   const filteredProducts = products.filter(p => {
-    const matchesCategory = selectedCategory 
-      ? p.category_name.toLowerCase().includes(selectedCategory.toLowerCase()) || selectedCategory.toLowerCase().includes(p.category_name.toLowerCase())
+    const matchesCategory = selectedCategory === SAVED
+      ? favorites.isFavorite(p.listing_id)
+      : selectedCategory ? p.category_name === selectedCategory : true;
+    const matchesSearch = query
+      ? p.item_name.toLowerCase().includes(query) || p.seller_name.toLowerCase().includes(query)
       : true;
-      
-    const matchesSearch = searchQuery
-      ? p.item_name.toLowerCase().includes(searchQuery.toLowerCase()) || p.seller_name.toLowerCase().includes(searchQuery.toLowerCase())
-      : true;
-      
     return matchesCategory && matchesSearch;
   });
 
+  const categoryLabel = selectedCategory === SAVED ? 'Saved' : selectedCategory;
+  const title = query ? `Results for “${searchQuery.trim()}”` : categoryLabel ? categoryLabel : 'Popular near you';
+  const emptyMessage = query
+    ? `Nothing matches “${searchQuery.trim()}”${categoryLabel ? ` in ${categoryLabel}` : ''}.`
+    : selectedCategory === SAVED ? 'Tap the heart on a listing to save it here.'
+      : selectedCategory ? `Nobody is selling ${selectedCategory} right now.`
+        : 'No listings yet. Be the first to sell something!';
+
   return (
     <>
-      <Header 
-        cartCount={totalCartItems} 
-        user={user} 
-        onLogout={logout} 
-        onOrdersClick={() => navigate('/orders')} 
-        onSellerClick={() => navigate('/seller')} 
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-      />
-      
-      {notification.message && (
-        <div style={{
-          position: 'fixed', top: '80px', left: '50%', transform: 'translateX(-50%)', zIndex: 1000,
-          background: notification.type === 'error' ? 'var(--secondary-color)' : 'var(--primary-color)',
-          color: notification.type === 'error' ? 'white' : 'black',
-          padding: '1rem 2rem', borderRadius: '30px', fontWeight: 'bold', boxShadow: '0 10px 20px rgba(0,0,0,0.5)',
-          animation: 'slideDown 0.3s ease-out'
-        }}>
-          {notification.message}
-        </div>
-      )}
-      
+      <Header user={user} onLogout={logout} searchQuery={searchQuery} onSearchChange={setSearchQuery} />
+
       <main className="main-content">
-        <HeroBanner />
-        <CategoryList selectedCategory={selectedCategory} onSelectCategory={setSelectedCategory} />
-        
-        <div className="products-section">
+        <HeroBanner hostelName={user?.hostel_name} listingCount={products.length} />
+
+        <section className="products-section" aria-labelledby="listings-title">
           <div className="section-header">
-            <h3 className="section-title">{selectedCategory ? `${selectedCategory} near you` : `Trending on Floor ${user?.floor_id}`}</h3>
-            <button className="view-all-btn" onClick={() => setSelectedCategory(null)}>View All</button>
-          </div>
-          
-          <div className="products-grid">
-            {filteredProducts.length === 0 ? (
-              <p>No listings found in this category.</p>
-            ) : (
-              filteredProducts.map(product => {
-                const cartItem = cartItems.find(item => item.listing_id === product.listing_id);
-                return (
-                  <ProductCard 
-                    key={product.listing_id} 
-                    product={{
-                      ...product, 
-                      priority: product.priority_rank === 0 ? 'Same Floor' : 'Other Floor'
-                    }} 
-                    onAdd={handleAddToCart}
-                    onRemove={handleRemoveFromCart}
-                    cartQuantity={cartItem ? cartItem.quantity : 0}
-                  />
-                );
-              })
+            <motion.h3 id="listings-title" className="section-title" key={title} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              {title}
+            </motion.h3>
+            {(selectedCategory || query) && (
+              <button className="view-all-btn" onClick={() => { setSelectedCategory(null); setSearchQuery(''); }}>view all</button>
             )}
           </div>
-        </div>
+
+          <CategoryList
+            categories={categories}
+            selectedCategory={selectedCategory}
+            onSelectCategory={setSelectedCategory}
+            savedCount={favorites.ids.length}
+          />
+
+          {loading ? (
+            <div className="products-grid">
+              {Array.from({ length: 6 }, (_, i) => <SkeletonCard key={i} />)}
+            </div>
+          ) : (
+            <LayoutGroup>
+              <motion.div layout className="products-grid">
+                <AnimatePresence mode="popLayout">
+                  {filteredProducts.map((product, i) => (
+                    <ProductCard
+                      key={product.listing_id}
+                      index={i}
+                      product={{ ...product, sameHostel: product.priority_rank === 0 }}
+                      onAdd={handleAddToCart}
+                      onRemove={(p) => cart.remove(p.listing_id)}
+                      cartQuantity={cart.quantityOf(product.listing_id)}
+                      isOwn={Number(product.seller_id) === Number(user?.student_id)}
+                      isFavorite={favorites.isFavorite(product.listing_id)}
+                      onToggleFavorite={favorites.toggle}
+                    />
+                  ))}
+                </AnimatePresence>
+              </motion.div>
+              <AnimatePresence>
+                {filteredProducts.length === 0 && (
+                  <motion.div className="empty-state" style={{ marginTop: '0.5rem' }}
+                    initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+                    <div className="empty-state-icon" aria-hidden="true"><SearchX size={22} /></div>
+                    <p>{emptyMessage}</p>
+                    {query && (
+                      <button className="btn btn-primary" style={{ marginTop: '0.75rem' }}
+                        onClick={() => navigate(`/seller?new_item=${encodeURIComponent(searchQuery.trim())}`)}>
+                        <Plus size={16} /> Have “{searchQuery.trim()}”? Sell it
+                      </button>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </LayoutGroup>
+          )}
+        </section>
       </main>
-      
-      {/* We pass a custom checkout handler to the FloatingCart. Let's update FloatingCart to accept it */}
-      <FloatingCart cartItems={cartItems} onCheckout={handleCheckout} />
+
+      <FloatingCart count={cart.count} total={cart.total} placing={cart.placing} onCheckout={handleCheckout} onView={() => navigate('/cart')} />
     </>
   );
 };

@@ -5,6 +5,9 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
+const v       = require('../utils/validate');
+
+router.param('id', v.intParam);   // ids must be numbers
 
 // ── GET /api/listings ────────────────────────────────────────
 // Returns all active listings, floor-priority sorted
@@ -13,9 +16,15 @@ router.get('/', auth, async (req, res) => {
   const buyer_floor_id = req.user.floor_id;
   try {
     const [rows] = await db.query(
-      'CALL sp_floor_priority_listings(?)', [buyer_floor_id]
+      // The procedure ranks the buyer's own hostel first (one internal floor per hostel);
+      // the seller's hostel is added for display, keeping the procedure's order.
+      `SELECT p.*, h.hostel_name AS seller_hostel, h.hostel_code AS seller_hostel_code
+       FROM sp_floor_priority_listings(?) p
+       JOIN Student s ON s.student_id = p.seller_id
+       JOIN Hostel  h ON h.hostel_id  = s.hostel_id
+       ORDER BY p.priority_rank, p.listing_id DESC`, [buyer_floor_id]
     );
-    res.json(rows[0]);  // stored procedure returns result in rows[0]
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ message: 'Error fetching listings.', error: err.message });
   }
@@ -28,7 +37,7 @@ router.get('/my', auth, async (req, res) => {
   try {
     const [rows] = await db.query(
       `SELECT l.listing_id, i.item_name, i.brand, l.mrp, l.selling_price,
-              l.quantity_available, l.description, l.photo_url, l.listing_status, l.created_at
+              l.quantity_available, l.description, l.photo_url, l.room_number, l.listing_status, l.created_at
        FROM Listing l
        JOIN Item i ON l.item_id = i.item_id
        WHERE l.seller_id = ?
@@ -41,43 +50,220 @@ router.get('/my', auth, async (req, res) => {
   }
 });
 
+const NEW_ITEMS_PER_DAY = 20;
+
+// Finds an item by name + brand (any capitalisation) or adds it to the catalogue.
+// Returns { item_id } or { error } for the seller.
+async function findOrCreateItem(newItem, student_id) {
+  if (!newItem || typeof newItem !== 'object') return { error: 'Choose an item from the list or add a new one.' };
+  const name  = typeof newItem.item_name === 'string' ? newItem.item_name.replace(/\s+/g, ' ').trim() : '';
+  const brand = typeof newItem.brand === 'string' && newItem.brand.trim() ? newItem.brand.replace(/\s+/g, ' ').trim() : null;
+  if (name.length < 2 || name.length > 150) return { error: 'Item name must be 2–150 characters.' };
+  if (!/[a-z0-9]/i.test(name)) return { error: 'Item name must contain letters or numbers.' };
+  if (brand && brand.length > 100) return { error: 'Brand can be at most 100 characters.' };
+  if (!v.isIntInRange(newItem.category_id, 1, 1e6)) return { error: 'Choose a category for the new item.' };
+
+  const [cats] = await db.query('SELECT category_id FROM Category WHERE category_id = ?', [newItem.category_id]);
+  if (cats.length === 0) return { error: 'Choose a category for the new item.' };
+
+  const findItem = async () => (await db.query(
+    `SELECT item_id FROM Item WHERE lower(item_name) = lower(?) AND lower(coalesce(brand, '')) = lower(coalesce(?, ''))`,
+    [name, brand]
+  ))[0][0];
+  const existing = await findItem();
+  if (existing) return { item_id: existing.item_id };
+
+  // Stop one account flooding the catalogue with made-up items
+  const [[{ recent }]] = await db.query(
+    `SELECT COUNT(*) AS recent FROM Item WHERE created_by = ? AND created_at > now() - interval '1 day'`, [student_id]
+  );
+  if (Number(recent) >= NEW_ITEMS_PER_DAY) {
+    return { error: `You can add at most ${NEW_ITEMS_PER_DAY} new items a day. Pick one from the list or try tomorrow.` };
+  }
+
+  // ON CONFLICT handles two sellers adding the same new item at the same moment
+  await db.query(
+    `INSERT INTO Item (item_name, brand, category_id, created_by) VALUES (?, ?, ?, ?)
+     ON CONFLICT (lower(item_name), lower(coalesce(brand, ''))) DO NOTHING`,
+    [name, brand, newItem.category_id, student_id]
+  );
+  return { item_id: (await findItem()).item_id };
+}
+
 // ── POST /api/listings ───────────────────────────────────────
 // Creates a new listing (price validation handled by DB trigger)
 router.post('/', auth, async (req, res) => {
-  const { item_id, mrp, selling_price, quantity_available, description, photo_url, room_number } = req.body;
+  let { item_id } = req.body;
+  // No room in the body: buyers collect from the room in the seller's profile
+  const { new_item, mrp, selling_price, quantity_available, description, photo_url } = req.body;
   const seller_id = req.user.student_id;
 
-  console.log("POST /api/listings payload:", { item_id, mrp, selling_price, quantity_available, description, photo_url_length: photo_url?.length, room_number });
+  // A seller can pick a catalogue item (item_id) or describe a new one (new_item)
+  if (!item_id && new_item) {
+    if (!mrp || !selling_price || !quantity_available) {
+      return res.status(400).json({ message: 'mrp, selling_price and quantity are required.' });
+    }
+    try {
+      const found = await findOrCreateItem(new_item, seller_id);
+      if (found.error) return res.status(400).json({ message: found.error });
+      item_id = found.item_id;
+    } catch (err) {
+      return res.status(500).json({ message: 'Error adding the item.', error: err.message });
+    }
+  }
 
-  if (!item_id || !mrp || !selling_price || !quantity_available || !room_number) {
-    console.log("Missing fields");
-    return res.status(400).json({ message: 'item_id, mrp, selling_price, quantity, and room_number are required.' });
+  if (!item_id || !mrp || !selling_price || !quantity_available) {
+    return res.status(400).json({ message: 'item_id, mrp, selling_price and quantity are required.' });
+  }
+  if (!v.isIntInRange(item_id, 1, 2147483647)) {
+    return res.status(400).json({ message: 'Choose an item from the list.' });
+  }
+  if (!v.isPrice(mrp) || !v.isPrice(selling_price)) {
+    return res.status(400).json({ message: 'MRP and selling price must be positive amounts (max 2 decimals, up to ₹1,00,000).' });
+  }
+  if (!v.isIntInRange(quantity_available, 1, 1000)) {
+    return res.status(400).json({ message: 'Quantity must be a whole number between 1 and 1000.' });
+  }
+  if (description != null && description !== '' && !v.isNonEmptyString(description, 500)) {
+    return res.status(400).json({ message: 'Description can be at most 500 characters.' });
+  }
+  if (!v.isOptionalImage(photo_url)) {
+    return res.status(400).json({ message: 'Photo must be an image uploaded with the photo picker.' });
   }
 
   try {
+    const [[me]] = await db.query('SELECT room_number FROM Student WHERE student_id = ?', [seller_id]);
+    const room_number = me && me.room_number;
+    if (!room_number) {
+      return res.status(400).json({ message: 'Add your room number in your profile first — buyers collect from there.', code: 'ROOM_REQUIRED' });
+    }
+
     // fn_is_price_valid checks price <= 1.5x MRP
     const [check] = await db.query(
       'SELECT fn_is_price_valid(?, ?) AS valid', [mrp, selling_price]
     );
     if (!check[0].valid) {
-      console.log("Price invalid");
       return res.status(400).json({ message: 'Selling price cannot exceed 1.5x MRP.' });
     }
 
     await db.query(
       `INSERT INTO Listing (seller_id, item_id, mrp, selling_price, quantity_available, description, photo_url, room_number)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [seller_id, item_id, mrp, selling_price, quantity_available, description || null, photo_url || null, room_number]
+      [seller_id, item_id, mrp, selling_price, quantity_available,
+       description ? description.trim() : null, photo_url || null, room_number]
     );
 
-    res.status(201).json({ message: 'Listing created successfully!' });
+    res.status(201).json({ message: 'Listing created successfully!', item_id: Number(item_id) });
   } catch (err) {
-    console.error("DB Error:", err);
     // Catch trigger errors (e.g. duplicate active listing)
     if (err.sqlState === '45000') {
       return res.status(400).json({ message: err.message });
     }
+    if (err.code === 'ER_NO_REFERENCED_ROW_2') {
+      return res.status(400).json({ message: 'Choose an item from the list.' });
+    }
     res.status(500).json({ message: 'Error creating listing.', error: err.message });
+  }
+});
+
+// ── PATCH /api/listings/:id ──────────────────────────────────
+// Seller edits their own listing. Any subset of:
+//   mrp, selling_price, quantity_available, description, photo_url
+// (the pickup room comes from the seller's profile and changes with it)
+// Price rule (<= 1.5x MRP) is also enforced by trg_check_price_update.
+// Restocking an OutOfStock listing (quantity > 0) makes it Active again;
+// setting quantity to 0 marks it OutOfStock (trg_auto_out_of_stock).
+router.patch('/:id', auth, async (req, res) => {
+  const seller_id = req.user.student_id;
+  const { mrp, selling_price, quantity_available, description, photo_url } = req.body;
+
+  if (!v.isIntInRange(req.params.id, 1, 2147483647)) {
+    return res.status(400).json({ message: 'Invalid listing.' });
+  }
+  const provided = { mrp, selling_price, quantity_available, description, photo_url };
+  if (Object.values(provided).every(x => x === undefined)) {
+    return res.status(400).json({ message: 'Nothing to update.' });
+  }
+  if (mrp !== undefined && !v.isPrice(mrp)) {
+    return res.status(400).json({ message: 'MRP must be a positive amount (max 2 decimals, up to ₹1,00,000).' });
+  }
+  if (selling_price !== undefined && !v.isPrice(selling_price)) {
+    return res.status(400).json({ message: 'Selling price must be a positive amount (max 2 decimals, up to ₹1,00,000).' });
+  }
+  if (quantity_available !== undefined && !v.isIntInRange(quantity_available, 0, 1000)) {
+    return res.status(400).json({ message: 'Quantity must be a whole number between 0 and 1000.' });
+  }
+  if (description !== undefined && description !== null && description !== '' && !v.isNonEmptyString(description, 500)) {
+    return res.status(400).json({ message: 'Description can be at most 500 characters.' });
+  }
+  if (photo_url !== undefined && !v.isOptionalImage(photo_url)) {
+    return res.status(400).json({ message: 'Photo must be an image uploaded with the photo picker.' });
+  }
+
+  try {
+    const [rows] = await db.query(
+      `SELECT listing_id, seller_id, item_id, mrp, selling_price, listing_status
+       FROM Listing WHERE listing_id = ?`,
+      [req.params.id]
+    );
+    const listing = rows[0];
+    if (!listing) return res.status(404).json({ message: 'Listing not found.' });
+    if (Number(listing.seller_id) !== Number(seller_id)) {
+      return res.status(403).json({ message: 'You can only edit your own listings.' });
+    }
+    if (listing.listing_status === 'Removed') {
+      return res.status(400).json({ message: 'Removed listings cannot be edited. Create a new listing instead.' });
+    }
+
+    const newMrp   = mrp !== undefined ? Number(mrp) : Number(listing.mrp);
+    const newPrice = selling_price !== undefined ? Number(selling_price) : Number(listing.selling_price);
+    const [check] = await db.query('SELECT fn_is_price_valid(?, ?) AS valid', [newMrp, newPrice]);
+    if (!check[0].valid) {
+      return res.status(400).json({ message: 'Selling price cannot exceed 1.5x MRP.' });
+    }
+
+    // Work out the status after the edit
+    let newStatus = listing.listing_status;
+    if (quantity_available !== undefined) {
+      const qty = Number(quantity_available);
+      if (qty === 0) newStatus = 'OutOfStock';
+      else if (listing.listing_status === 'OutOfStock') newStatus = 'Active';
+    }
+    if (newStatus === 'Active' && listing.listing_status !== 'Active') {
+      // Same rule as trg_one_active_listing: one Active listing per item per seller
+      const [dupes] = await db.query(
+        `SELECT listing_id FROM Listing
+         WHERE seller_id = ? AND item_id = ? AND listing_status = 'Active' AND listing_id <> ?`,
+        [seller_id, listing.item_id, listing.listing_id]
+      );
+      if (dupes.length > 0) {
+        return res.status(400).json({ message: 'You already have another Active listing for this item. Edit that one instead.' });
+      }
+    }
+
+    await db.query(
+      `UPDATE Listing
+       SET mrp                = ?,
+           selling_price      = ?,
+           quantity_available = COALESCE(?, quantity_available),
+           description        = CASE WHEN ?::boolean THEN ? ELSE description END,
+           photo_url          = CASE WHEN ?::boolean THEN ? ELSE photo_url END,
+           listing_status     = ?
+       WHERE listing_id = ?`,
+      [newMrp, newPrice,
+       quantity_available !== undefined ? Number(quantity_available) : null,
+       description !== undefined, description ? description.trim() : null,
+       photo_url !== undefined, photo_url || null,
+       newStatus,
+       listing.listing_id]
+    );
+
+    res.json({ message: 'Listing updated.', listing_status: newStatus });
+  } catch (err) {
+    if (err.sqlState === '45000') {
+      return res.status(400).json({ message: err.message });
+    }
+    res.status(500).json({ message: 'Error updating listing.', error: err.message });
   }
 });
 
@@ -95,7 +281,7 @@ router.delete('/:id', auth, async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Listing not found.' });
     }
-    if (rows[0].seller_id !== seller_id) {
+    if (Number(rows[0].seller_id) !== Number(seller_id)) {
       return res.status(403).json({ message: 'You can only remove your own listings.' });
     }
 
@@ -106,6 +292,19 @@ router.delete('/:id', auth, async (req, res) => {
     res.json({ message: 'Listing removed successfully.' });
   } catch (err) {
     res.status(500).json({ message: 'Error removing listing.', error: err.message });
+  }
+});
+
+// ── GET /api/listings/categories ─────────────────────────────
+// Category filter bar on the home page
+router.get('/categories', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      'SELECT category_id, category_name FROM Category ORDER BY category_id'
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Error fetching categories.', error: err.message });
   }
 });
 
